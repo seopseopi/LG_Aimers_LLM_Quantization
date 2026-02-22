@@ -1,0 +1,133 @@
+# @title [종합 평가] 모델별 랜덤 N회 반복 평균 리더보드
+import torch
+import time
+import os
+import gc
+import random
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from sentence_transformers import SentenceTransformer, util
+
+# 1. 설정
+MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+NUM_ROUNDS = 15
+QUESTIONS_PER_ROUND = 3 # 몇번 채점시켜서 평가할지
+
+model_paths = [
+    "/content/5_30down_ign_1024_Front4_model",             
+    "/content/5_30down_ign_1024_Front6_model",  
+    "/content/5_30down_ign_1024_Shuffle_Seq1024_model",
+    "/content/5_30down_ign_2048_model",
+    "/content/5_30down_ign_204_Seq256_model",
+    "/content/5_30down_ign_1024_model",
+    "/content/5_30down_ign_damp005_model",
+    "/content/ign_model/ign_model_model"
+]
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+sim_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+# 2. 데이터셋 로드
+print("[INFO] MANTA 데이터셋 로드 중...")
+full_ds = load_dataset("LGAI-EXAONE/MANTA-1M", split="train")
+total_data_size = len(full_ds)
+
+# 3. 베이스 모델 로딩 (Ref 기준점)
+print("[INFO] 베이스 모델(Ref) 로딩 중...")
+model_ref = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True
+)
+
+all_history = []
+
+# 4. 반복 평가 루프 시작
+for r in range(NUM_ROUNDS):
+    print(f"\n" + "🔄" * 20)
+    print(f"  [Round {r+1}/{NUM_ROUNDS}] 랜덤 샘플링 평가 시작")
+    print("🔄" * 20)
+
+    # 라운드별 랜덤 질문 추출
+    random_indices = random.sample(range(total_data_size), QUESTIONS_PER_ROUND)
+    round_prompts = [full_ds[idx]['conversations'][0]['content'] for idx in random_indices]
+    print(f"[INFO] 선택된 인덱스: {random_indices}")
+
+    for path in model_paths:
+        if not os.path.exists(path):
+            print(f"[경고] 경로 없음: {path}")
+            continue
+
+        model_name = os.path.basename(path)
+        print(f"\n> 평가 중: {model_name}")
+        
+        try:
+            model_quant = AutoModelForCausalLM.from_pretrained(
+                path, device_map="auto", trust_remote_code=True, local_files_only=True
+            )
+            
+            p_scores = []
+            s_scores = []
+            
+            for prompt in round_prompts:
+                messages = [{"role": "user", "content": prompt}]
+                input_tensor = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(device)
+                input_len = input_tensor.shape[1]
+
+                # Ref 추론
+                torch.cuda.synchronize()
+                start = time.time()
+                out_ref = model_ref.generate(input_tensor, max_new_tokens=100, do_sample=False)
+                torch.cuda.synchronize()
+                tps_ref = (time.time() - start) / max(len(out_ref[0][input_len:]), 1)
+
+                # Qnt 추론
+                torch.cuda.synchronize()
+                start = time.time()
+                out_quant = model_quant.generate(input_tensor, max_new_tokens=100, do_sample=False)
+                torch.cuda.synchronize()
+                tps_quant = (time.time() - start) / max(len(out_quant[0][input_len:]), 1)
+
+                # 유사도 점수 계산
+                ans_ref = tokenizer.decode(out_ref[0][input_len:], skip_special_tokens=True)
+                ans_quant = tokenizer.decode(out_quant[0][input_len:], skip_special_tokens=True)
+                
+                perf = util.pytorch_cos_sim(sim_model.encode(ans_ref, convert_to_tensor=True), 
+                                            sim_model.encode(ans_quant, convert_to_tensor=True)).item()
+                speed = tps_ref / tps_quant
+                
+                p_scores.append(perf)
+                s_scores.append(speed)
+
+            # 라운드 결과 저장
+            all_history.append({
+                "Model": model_name,
+                "Perf": np.mean(p_scores),
+                "Speed": np.mean(s_scores)
+            })
+
+            # 메모리 해제
+            del model_quant
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"[에러] {model_name}: {e}")
+
+# 5. 최종 통계 산출
+print("\n" + "📊" * 25)
+print("   [최종 결과] 모든 라운드 평균 리더보드")
+print("📊" * 25)
+
+df_final = pd.DataFrame(all_history)
+leaderboard = df_final.groupby("Model").agg({
+    "Perf": "mean",
+    "Speed": "mean"
+}).reset_index()
+
+leaderboard["Final_Score"] = 0.5 * leaderboard["Perf"] + 0.5 * leaderboard["Speed"]
+leaderboard = leaderboard.sort_values(by="Final_Score", ascending=False)
+
+print(leaderboard.to_markdown(index=False))
