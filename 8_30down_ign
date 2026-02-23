@@ -1,0 +1,104 @@
+import os
+import torch
+import shutil
+from pathlib import Path
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization import GPTQModifier
+
+# ==========================================
+# 1. 환경 설정 (Front-8 강화 세팅)
+# ==========================================
+MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+OUT_DIR = "./model_front8"
+DATASET_ID = "LGAI-EXAONE/MANTA-1M"
+DATASET_SPLIT = "train"
+
+NUM_CALIBRATION_SAMPLES = 1024 
+MAX_SEQUENCE_LENGTH = 512
+
+# ==========================================
+# 2. 레이어 무시 전략 (Front 8 + All down_proj)
+# ==========================================
+# (1) 0~7번 레이어: 전체 FP16 보존 (기존 6개에서 8개로 확장)
+skip_indices_front = list(range(0, 8))
+skip_layers_front = []
+for i in skip_indices_front:
+    skip_layers_front.extend([
+        f"model.layers.{i}.self_attn.q_proj",
+        f"model.layers.{i}.self_attn.k_proj",
+        f"model.layers.{i}.self_attn.v_proj",
+        f"model.layers.{i}.self_attn.o_proj",
+        f"model.layers.{i}.mlp.gate_proj",
+        f"model.layers.{i}.mlp.up_proj",
+        f"model.layers.{i}.mlp.down_proj"
+    ])
+
+# (2) 8~29번 레이어: down_proj만 FP16 보존
+skip_indices_rest = list(range(8, 30))
+skip_layers_rest_down = [f"model.layers.{i}.mlp.down_proj" for i in skip_indices_rest]
+
+# (3) 최종 무시 리스트
+IGNORE = ["embed_tokens", "lm_head"] + skip_layers_front + skip_layers_rest_down
+
+print(f"[INFO] Front-8 강화 모델 설정 완료 (보호 모듈: {len(IGNORE)}개)")
+
+# ==========================================
+# 3. 모델 및 데이터 로딩
+# ==========================================
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
+)
+
+# 0.618점 당시의 성공 공식: 셔플 없이 순차 1024개
+ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
+
+def preprocess(example):
+    return {
+        "text": tokenizer.apply_chat_template(
+            example["conversations"],
+            add_generation_prompt=True,
+            tokenize=False)
+    }
+
+ds = ds.map(preprocess)
+
+# ==========================================
+# 4. GPTQ 양자화 (Dampening 0.1)
+# ==========================================
+recipe = [
+    GPTQModifier(
+        scheme="W4A16",
+        targets=["Linear"],
+        ignore=IGNORE,
+        dampening_frac=0.1
+    )
+]
+
+print(f"[INFO] Front-8 모델 양자화 시작...")
+
+oneshot(
+    model=model,
+    dataset=ds,
+    recipe=recipe,
+    max_seq_length=MAX_SEQUENCE_LENGTH,
+    num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+)
+
+# ==========================================
+# 5. 저장 및 제출용 압축
+# ==========================================
+if os.path.exists(OUT_DIR):
+    shutil.rmtree(OUT_DIR)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+model.save_pretrained(OUT_DIR, save_compressed=True)
+tokenizer.save_pretrained(OUT_DIR)
+
+# 가이드에 맞는 파일명으로 압축
+shutil.make_archive(base_name="submit", format="zip", root_dir=".", base_dir=OUT_DIR)
+print(f"[INFO] Front-8 모델 압축 완료: submit.zip")
