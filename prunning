@@ -1,0 +1,45 @@
+import torch
+from datasets import load_dataset, Dataset  # Dataset 추가
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from llmcompressor.modifiers.pruning import WandaPruningModifier
+from llmcompressor import oneshot
+
+MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+SAVE_PATH = "./model_pruned"
+
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+# 1. 커스텀 데이터셋 전처리 (Dataset 객체로 반환하도록 수정)
+def get_prune_dataset(num_samples=64):
+    ds = load_dataset("LGAI-EXAONE/MANTA-1M", split="train", streaming=True)
+    samples = []
+    for i, ex in enumerate(ds):
+        if i >= num_samples: break
+        text = tokenizer.apply_chat_template(ex["conversations"], tokenize=False, add_generation_prompt=True)
+        enc = tokenizer(text, truncation=True, max_length=512, return_tensors="pt")
+        # oneshot 내부 로직을 위해 필요한 컬럼들을 딕셔너리로 구성
+        samples.append({
+            "input_ids": enc.input_ids[0].tolist(), 
+            "attention_mask": enc.attention_mask[0].tolist()
+        })
+    
+    # [수정 포인트] 리스트를 Dataset 객체로 변환
+    return Dataset.from_list(samples)
+
+# 2. Pruning 실행
+recipe = WandaPruningModifier(
+    sparsity=0.40,
+    targets=[f"model.layers.{i}.mlp.down_proj" for i in range(6)]
+)
+
+# 이제 dataset은 .column_names 속성을 가진 Dataset 객체가 됩니다.
+oneshot(model=model, dataset=get_prune_dataset(), recipe=recipe)
+
+# 3. 마스크 생성 및 저장
+masks = {n: (p != 0).detach().cpu() for n, p in model.named_parameters() if "down_proj" in n}
+torch.save(masks, "pruning_masks.pt")
+
+model.save_pretrained(SAVE_PATH)
+tokenizer.save_pretrained(SAVE_PATH)
+print("Step 1 완료: AttributeError 해결 및 프루닝 모델 저장됨.")
