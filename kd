@@ -1,0 +1,115 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from datasets import load_dataset, Dataset
+from transformers import (
+    AutoModelForCausalLM, 
+    AutoTokenizer, 
+    Trainer, 
+    TrainingArguments, 
+    DataCollatorWithPadding
+)
+
+# 1. 경로 및 설정
+PRUNED_PATH = "./model_pruned"
+TEACHER_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+MASKS_PATH = "pruning_masks.pt"
+OUTPUT_KD = "./model_kd"
+
+# 2. 모델 및 토크나이저 로드
+print("💡 모델 및 스승 모델 로딩 중...")
+tokenizer = AutoTokenizer.from_pretrained(TEACHER_ID)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+student = AutoModelForCausalLM.from_pretrained(PRUNED_PATH, torch_dtype=torch.bfloat16, device_map="auto")
+teacher = AutoModelForCausalLM.from_pretrained(TEACHER_ID, torch_dtype=torch.bfloat16, device_map="auto")
+masks = torch.load(MASKS_PATH)
+
+# 가중치 0 유지 함수 (Masking)
+def apply_masks(model, masks):
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if any(m_name in n for m_name in masks.keys()):
+                # pruning_masks.pt의 키값과 모델 파라미터 이름 매칭
+                key = next(k for k in masks.keys() if k in n)
+                p.data *= masks[key].to(p.device)
+
+# 3. 데이터셋 준비 (labels를 여기서 넣지 않습니다)
+def get_kd_dataset(num_samples=8000):
+    print(f"💡 {num_samples}개의 KD용 데이터셋 생성 중...")
+    ds = load_dataset("LGAI-EXAONE/MANTA-1M", split="train", streaming=True)
+    samples = []
+    for i, ex in enumerate(ds):
+        if i >= num_samples: break
+        text = tokenizer.apply_chat_template(ex["conversations"], tokenize=False, add_generation_prompt=True)
+        enc = tokenizer(text, truncation=True, max_length=512)
+        # labels를 빼고 input_ids와 attention_mask만 넘깁니다.
+        samples.append({
+            "input_ids": enc.input_ids, 
+            "attention_mask": enc.attention_mask
+        })
+    return Dataset.from_list(samples)
+
+kd_data = get_kd_dataset(num_samples=8000)
+# Collator가 이제 input_ids의 길이를 배치별로 잘 맞춰줄 겁니다.
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+# 4. Masked KD Trainer 정의 (최신 Transformers 규격 적용)
+class MaskedKDTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # [수정] 가중치 0 유지를 위한 마스크 적용
+        apply_masks(model, masks)
+        
+        # Student 추론
+        outputs = model(**inputs)
+        
+        # Teacher 추론 (Student와 동일한 디바이스의 데이터 사용)
+        with torch.no_grad():
+            # 스승 모델이 여러 GPU에 나뉘어 있을 수 있으므로 inputs를 적절히 배치
+            teacher_outputs = teacher(**inputs)
+
+        s_logits = outputs.logits
+        t_logits = teacher_outputs.logits
+        
+        # KL Divergence Loss (T=2.0)
+        T = 2.0
+        # 스승과 제자의 지식 차이를 계산
+        kd_loss = nn.KLDivLoss(reduction="batchmean")(
+            F.log_softmax(s_logits / T, dim=-1),
+            F.softmax(t_logits / T, dim=-1)
+        ) * (T ** 2)
+        
+        return (kd_loss, outputs) if return_outputs else kd_loss
+
+# 5. 트레이닝 인자 설정
+args = TrainingArguments(
+    output_dir=OUTPUT_KD,
+    max_steps=1500,               # 500보다는 확실하고 5000보다는 빠른 '안전 지대'
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=8, 
+    learning_rate=1e-5,          
+    bf16=True,
+    logging_steps=10,
+    save_strategy="steps",        # 혹시 모르니 중간 저장
+    save_steps=500,               # 500스텝마다 저장해서 불안하면 중간걸로라도 제출
+    report_to="none"
+)
+
+# 6. 학습 시작
+print("🚀 [최종 시도] Masked KD 학습을 시작합니다!")
+trainer = MaskedKDTrainer(
+    model=student, 
+    args=args, 
+    train_dataset=kd_data,
+    data_collator=data_collator
+)
+
+trainer.train()
+
+# 7. 최종 저장 전 마스크 마지막 확인 및 저장
+print("✅ 학습 완료! 최종 모델 저장 중...")
+apply_masks(student, masks)
+student.save_pretrained(OUTPUT_KD)
+tokenizer.save_pretrained(OUTPUT_KD)
+print(f"🎉 모든 과정 완료. 모델이 {OUTPUT_KD}에 저장되었습니다.")
